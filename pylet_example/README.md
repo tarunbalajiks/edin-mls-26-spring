@@ -1,6 +1,22 @@
-# PyLet Example — Two LLMs Debating Each Other
+# PyLet Example — Two LLMs Debating (SLURM Edition)
 
-Deploy two LLM instances on a GPU cluster with PyLet. One plays a **Python fan**, the other plays a **Rust evangelist**. They debate back and forth automatically.
+Deploy two `Qwen/Qwen3.5-2B` instances on a SLURM GPU cluster with PyLet. One plays a **Python fan**, the other plays a **Rust evangelist**. They debate back and forth automatically.
+
+## Architecture
+
+```
+Login Node (gala2)            Compute Node (saxa, 2× GPU)
+┌──────────────┐              ┌──────────────────────────┐
+│  pylet head  │◄────────────►│     pylet worker         │
+│  (port 8000) │              │  GPU 0 → vLLM python-fan │
+│              │              │  GPU 1 → vLLM rust-fan   │
+│  debate.py   │              └──────────────────────────┘
+└──────────────┘
+```
+
+- **Head** runs on the login node (no GPU needed, just the scheduler).
+- **Worker** runs on a SLURM-allocated compute node with 2 GPUs.
+- Each vLLM instance gets 1 GPU via PyLet's automatic allocation.
 
 ## Prerequisites
 
@@ -8,50 +24,61 @@ Deploy two LLM instances on a GPU cluster with PyLet. One plays a **Python fan**
 pip install pylet vllm openai
 ```
 
-## Terminal 1: Start head
+## Step-by-step
+
+### 1. Start the head node (Login Node — Terminal 1)
 
 ```bash
 pylet start
 ```
 
-## Terminal 2: Start worker (with 2 GPUs)
+This starts the PyLet scheduler on `gala2:8000`.
+
+### 2. Submit the SLURM worker (Login Node — Terminal 2)
 
 ```bash
-pylet start --head localhost:8000 --gpu-units 2
+cd edin-mls-26-spring/pylet_example
+sbatch start_worker.sh
 ```
 
-> Only 1 GPU? Use `--gpu-units 1` and deploy them one at a time on the same GPU with `--no-exclusive`.
+This allocates 2 GPUs on `saxa` and starts a PyLet worker that registers with the head.
 
-## Terminal 3: Deploy both models
+Check that the worker registered:
 
-### Launch two vLLM instances
+```bash
+pylet list-workers
+```
+
+You should see 1 worker with 2 GPU units available.
+
+### 3. Deploy two vLLM instances (Login Node — Terminal 2)
 
 ```bash
 # Python fan
 pylet submit \
-  'vllm serve Qwen/Qwen2.5-1.5B-Instruct --port $PORT' \
+  'vllm serve Qwen/Qwen3.5-2B --port $PORT' \
   --name python-fan --gpu-units 1
 
 # Rust evangelist
 pylet submit \
-  'vllm serve Qwen/Qwen2.5-1.5B-Instruct --port $PORT' \
+  'vllm serve Qwen/Qwen3.5-2B --port $PORT' \
   --name rust-fan --gpu-units 1
 ```
 
-Wait for both:
+Wait for both to be ready:
 
 ```bash
-pylet get-endpoint --name python-fan   # → e.g. 192.168.1.10:15600
-pylet get-endpoint --name rust-fan     # → e.g. 192.168.1.10:15601
+pylet get-endpoint --name python-fan   # → e.g. saxa:15600
+pylet get-endpoint --name rust-fan     # → e.g. saxa:15601
 ```
 
-### Run the debate
+### 4. Run the debate (Login Node — Terminal 2)
 
 ```bash
 python debate.py <python-fan-endpoint> <rust-fan-endpoint>
 
 # Example:
-python debate.py 192.168.1.10:15600 192.168.1.10:15601
+python debate.py saxa:15600 saxa:15601
 ```
 
 ### Example output
@@ -78,23 +105,33 @@ collection pauses.
 ...
 ```
 
-### Clean up
+### 5. Clean up
 
 ```bash
 pylet cancel $(pylet get-instance --name python-fan | grep -o '[a-f0-9-]\{36\}')
 pylet cancel $(pylet get-instance --name rust-fan   | grep -o '[a-f0-9-]\{36\}')
+scancel --name pylet-worker   # release the SLURM GPUs
 ```
 
 ---
+
+## Files
+
+| File | Purpose |
+|---|---|
+| `debate.py` | Python vs Rust debate script (uses OpenAI client) |
+| `start_worker.sh` | SLURM batch script — launches pylet worker with 2 GPUs |
+| `README.md` | This file |
 
 ## What this shows
 
 | PyLet Feature | How it's used |
 |---|---|
-| **Multi-instance** | Two vLLM servers running simultaneously |
-| **Auto GPU allocation** | Each gets its own GPU via `--gpu-units 1` |
+| **Head on login node** | Scheduler runs without GPU, accessible from anywhere |
+| **Worker via SLURM** | `sbatch` allocates GPUs; pylet worker manages them |
+| **Multi-instance** | Two vLLM servers running simultaneously, 1 GPU each |
 | **Auto port** | `$PORT` → each server gets a unique port |
 | **Service discovery** | `get-endpoint` finds both by name |
-| **Standard API** | Both expose OpenAI-compatible endpoints, use any client |
+| **Standard API** | Both expose OpenAI-compatible endpoints |
 
-Same pattern scales to any multi-model setup: RAG pipelines, model A/B testing, ensemble inference.
+Same pattern scales to any multi-model SLURM setup: RAG pipelines, model A/B testing, ensemble inference.

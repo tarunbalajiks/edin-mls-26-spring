@@ -18,7 +18,7 @@ import sys
 from openai import OpenAI
 
 # -- Config --
-MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
+MODEL = "Qwen/Qwen3.5-2B"
 ROUNDS = 3
 TOPIC = "Which language is better for building distributed systems?"
 
