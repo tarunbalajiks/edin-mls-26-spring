@@ -21,8 +21,9 @@ Login Node (gala2)            Compute Node (saxa, 2× GPU)
 ## Prerequisites
 
 ```bash
-pip install pylet
-pip install sglang==0.5.6
+pip install uv
+uv pip install pylet
+uv pip install sglang==0.5.6
 ```
 
 If you do not have cuda toolkit installed (i.e., no CUDA or NVCC found), please do:
