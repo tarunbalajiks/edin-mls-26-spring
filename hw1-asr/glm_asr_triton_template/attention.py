@@ -225,6 +225,7 @@ def flash_attention_kernel(
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, BLOCK_D)
+    mask_m = offs_m < seq_q
 
     q = tl.load(
         q_ptr + pid_bh * stride_q0 + offs_m[:, None] * stride_q1 + offs_d[None, :] * stride_q2,
@@ -253,6 +254,7 @@ def flash_attention_kernel(
 
         qk = tl.dot(q, tl.trans(k)) * scale
         qk = tl.where(mask_n[None, :], qk, -float("inf"))
+        qk = tl.where(mask_m[:, None], qk, -float("inf"))
 
         if IS_CAUSAL:
             causal_mask = offs_n[None, :] > offs_m[:, None]
@@ -274,12 +276,12 @@ def flash_attention_kernel(
         )
         v = v.to(tl.float32)
 
-        acc = acc * (l_i * tl.exp(m_i - m_new))[:, None] + tl.dot(p, v)
+        acc = acc * tl.exp(m_i - m_new)[:, None] + tl.dot(p, v)
 
         m_i = m_new
         l_i = l_new
 
-    acc = acc / l_i[:, None]
+    acc = tl.where(mask_m[:, None], acc / l_i[:, None], 0.0)
 
     tl.store(
         o_ptr + pid_bh * stride_o0 + offs_m[:, None] * stride_o1 + offs_d[None, :] * stride_o2,
