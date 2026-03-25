@@ -367,6 +367,10 @@ FLASH_BLOCK_M = 32
 FLASH_BLOCK_N = 32
 FLASH_NUM_WARPS = 2
 FLASH_NUM_STAGES = 1
+FLASH_DECODE_BLOCK_M = 1
+FLASH_DECODE_BLOCK_N = 64
+FLASH_DECODE_NUM_WARPS = 2
+FLASH_DECODE_NUM_STAGES = 1
 
 
 def scaled_dot_product_attention(
@@ -402,63 +406,99 @@ def scaled_dot_product_attention(
         k_flat = k.reshape(batch * num_heads, seq_k, head_dim).to(torch.float32)
         v_flat = v.reshape(batch * num_heads, seq_k, head_dim).to(torch.float32)
 
-        if seq_k_padded != seq_k or head_dim_padded != head_dim:
-            k_padded = torch.zeros(
-                (batch * num_heads, seq_k_padded, head_dim_padded),
+        if use_flash:
+            output = torch.empty(
+                (batch * num_heads, seq_q, head_dim),
                 dtype=torch.float32,
                 device=q.device,
             )
-            v_padded = torch.zeros_like(k_padded)
-            q_padded = torch.zeros(
+            if seq_q == 1:
+                flash_grid = (batch * num_heads, 1)
+                flash_attention_kernel[flash_grid](
+                    q_flat,
+                    k_flat,
+                    v_flat,
+                    output,
+                    seq_q,
+                    seq_k,
+                    head_dim,
+                    q_flat.stride(0),
+                    q_flat.stride(1),
+                    q_flat.stride(2),
+                    k_flat.stride(0),
+                    k_flat.stride(1),
+                    k_flat.stride(2),
+                    v_flat.stride(0),
+                    v_flat.stride(1),
+                    v_flat.stride(2),
+                    output.stride(0),
+                    output.stride(1),
+                    output.stride(2),
+                    float(scale),
+                    IS_CAUSAL=is_causal,
+                    BLOCK_M=FLASH_DECODE_BLOCK_M,
+                    BLOCK_N=FLASH_DECODE_BLOCK_N,
+                    BLOCK_D=head_dim_padded,
+                    num_warps=FLASH_DECODE_NUM_WARPS,
+                    num_stages=FLASH_DECODE_NUM_STAGES,
+                )
+            else:
+                flash_grid = (batch * num_heads, triton.cdiv(seq_q, FLASH_BLOCK_M))
+                flash_attention_kernel[flash_grid](
+                    q_flat,
+                    k_flat,
+                    v_flat,
+                    output,
+                    seq_q,
+                    seq_k,
+                    head_dim,
+                    q_flat.stride(0),
+                    q_flat.stride(1),
+                    q_flat.stride(2),
+                    k_flat.stride(0),
+                    k_flat.stride(1),
+                    k_flat.stride(2),
+                    v_flat.stride(0),
+                    v_flat.stride(1),
+                    v_flat.stride(2),
+                    output.stride(0),
+                    output.stride(1),
+                    output.stride(2),
+                    float(scale),
+                    IS_CAUSAL=is_causal,
+                    BLOCK_M=FLASH_BLOCK_M,
+                    BLOCK_N=FLASH_BLOCK_N,
+                    BLOCK_D=head_dim_padded,
+                    num_warps=FLASH_NUM_WARPS,
+                    num_stages=FLASH_NUM_STAGES,
+                )
+        else:
+            if seq_k_padded != seq_k or head_dim_padded != head_dim:
+                k_padded = torch.zeros(
+                    (batch * num_heads, seq_k_padded, head_dim_padded),
+                    dtype=torch.float32,
+                    device=q.device,
+                )
+                v_padded = torch.zeros_like(k_padded)
+                q_padded = torch.zeros(
+                    (batch * num_heads, seq_q, head_dim_padded),
+                    dtype=torch.float32,
+                    device=q.device,
+                )
+                k_padded[:, :seq_k, :head_dim] = k_flat
+                v_padded[:, :seq_k, :head_dim] = v_flat
+                q_padded[:, :, :head_dim] = q_flat
+                k_flat = k_padded
+                v_flat = v_padded
+                q_flat = q_padded
+
+            output = torch.empty(
                 (batch * num_heads, seq_q, head_dim_padded),
                 dtype=torch.float32,
                 device=q.device,
             )
-            k_padded[:, :seq_k, :head_dim] = k_flat
-            v_padded[:, :seq_k, :head_dim] = v_flat
-            q_padded[:, :, :head_dim] = q_flat
-            k_flat = k_padded
-            v_flat = v_padded
-            q_flat = q_padded
 
-        output = torch.empty(
-            (batch * num_heads, seq_q, head_dim_padded),
-            dtype=torch.float32,
-            device=q.device,
-        )
-
-        grid = (batch * num_heads, seq_q)
-        if use_flash:
-            flash_grid = (batch * num_heads, triton.cdiv(seq_q, FLASH_BLOCK_M))
-            flash_attention_kernel[flash_grid](
-                q_flat,
-                k_flat,
-                v_flat,
-                output,
-                seq_q,
-                seq_k,
-                head_dim,
-                q_flat.stride(0),
-                q_flat.stride(1),
-                q_flat.stride(2),
-                k_flat.stride(0),
-                k_flat.stride(1),
-                k_flat.stride(2),
-                v_flat.stride(0),
-                v_flat.stride(1),
-                v_flat.stride(2),
-                output.stride(0),
-                output.stride(1),
-                output.stride(2),
-                float(scale),
-                IS_CAUSAL=is_causal,
-                BLOCK_M=FLASH_BLOCK_M,
-                BLOCK_N=FLASH_BLOCK_N,
-                BLOCK_D=head_dim_padded,
-                num_warps=FLASH_NUM_WARPS,
-                num_stages=FLASH_NUM_STAGES,
-            )
-        else:
+            grid = (batch * num_heads, seq_q)
             scores = torch.empty(
                 (batch * num_heads, seq_q, seq_k_padded),
                 dtype=torch.float32,
@@ -545,7 +585,7 @@ def scaled_dot_product_attention(
                 num_stages=ATTENTION_NUM_STAGES,
             )
 
-        if head_dim_padded != head_dim:
+        if (not use_flash) and head_dim_padded != head_dim:
             output = output[:, :, :head_dim]
 
         return output.reshape(batch, num_heads, seq_q, head_dim).to(q.dtype)
