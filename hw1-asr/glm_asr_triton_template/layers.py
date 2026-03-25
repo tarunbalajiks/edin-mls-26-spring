@@ -509,7 +509,7 @@ class RMSNorm:
         self.hidden_size = hidden_size
         self.eps = eps
         self.weight = torch.ones(hidden_size, dtype=torch.float32)
-        self.use_triton = _is_power_of_two(hidden_size) # This flag will force a fallback to a PyTorch implementation of the kernels when the hidden_size is not a power of 2.
+        self.use_triton = True
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         original_shape = x.shape
@@ -553,7 +553,7 @@ class LayerNorm:
         self.eps = eps
         self.weight = torch.ones(hidden_size, dtype=torch.float32)
         self.bias = torch.zeros(hidden_size, dtype=torch.float32)
-        self.use_triton = _is_power_of_two(hidden_size)  # This flag will force a fallback to a PyTorch implementation of the kernels when the hidden_size is not a power of 2.
+        self.use_triton = True
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         original_shape = x.shape
@@ -642,8 +642,10 @@ class Linear:
     TILE_M = 64
     TILE_N = 64
     TILE_K = 32
+    NUM_WARPS = 4
+    NUM_STAGES = 2
 
-    BACKEND = "torch"
+    BACKEND = "triton"
 
     def __init__(self, in_features: int, out_features: int, bias: bool = True):
         self.in_features = in_features
@@ -758,6 +760,8 @@ class Linear:
             BLOCK_M=self.TILE_M,
             BLOCK_N=self.TILE_N,
             BLOCK_K=self.TILE_K,
+            num_warps=self.NUM_WARPS,
+            num_stages=self.NUM_STAGES,
         )
 
         output = output[:M, :N]
@@ -848,6 +852,8 @@ class MLP:
 
     FUSED = True
     TILE_M, TILE_N, TILE_K = 64, 64, 32
+    NUM_WARPS = 4
+    NUM_STAGES = 2
 
     def __init__(
         self,
@@ -961,6 +967,8 @@ class MLP:
             BLOCK_M=self.TILE_M,
             BLOCK_N=self.TILE_N,
             BLOCK_K=self.TILE_K,
+            num_warps=self.NUM_WARPS,
+            num_stages=self.NUM_STAGES,
         )
 
         if M != M_pad or N != N_pad:
@@ -975,6 +983,8 @@ class EncoderMLP:
 
     FUSED = True
     TILE_M, TILE_N, TILE_K = 64, 64, 32
+    NUM_WARPS = 4
+    NUM_STAGES = 2
 
     def __init__(
         self,
@@ -1064,6 +1074,8 @@ class EncoderMLP:
             BLOCK_M=self.TILE_M,
             BLOCK_N=self.TILE_N,
             BLOCK_K=self.TILE_K,
+            num_warps=self.NUM_WARPS,
+            num_stages=self.NUM_STAGES,
         )
 
         if M != M_pad or N != N_pad:

@@ -261,6 +261,10 @@ def next_power_of_two(x: int) -> int:
 
 
 MAX_ATTENTION_DIM = 256
+ATTENTION_NUM_WARPS = 4
+ATTENTION_NUM_STAGES = 2
+SOFTMAX_NUM_WARPS = 4
+SOFTMAX_NUM_STAGES = 2
 
 
 def scaled_dot_product_attention(
@@ -343,6 +347,8 @@ def scaled_dot_product_attention(
             scores.stride(2),
             BLOCK_K=seq_k_padded,
             BLOCK_D=head_dim_padded,
+            num_warps=ATTENTION_NUM_WARPS,
+            num_stages=ATTENTION_NUM_STAGES,
         )
 
         if seq_k_padded != seq_k:
@@ -374,7 +380,12 @@ def scaled_dot_product_attention(
         scores_2d = scores.reshape(batch * num_heads * seq_q, seq_k_padded)
         block = seq_k_padded
         softmax_inplace_kernel[(scores_2d.shape[0],)](
-            scores_2d, scores_2d.stride(0), seq_k_padded, BLOCK_SIZE=block
+            scores_2d,
+            scores_2d.stride(0),
+            seq_k_padded,
+            BLOCK_SIZE=block,
+            num_warps=SOFTMAX_NUM_WARPS,
+            num_stages=SOFTMAX_NUM_STAGES,
         )
         scores = scores_2d.reshape(batch * num_heads, seq_q, seq_k_padded)
 
@@ -395,6 +406,8 @@ def scaled_dot_product_attention(
             output.stride(2),
             BLOCK_K=seq_k_padded,
             BLOCK_D=head_dim_padded,
+            num_warps=ATTENTION_NUM_WARPS,
+            num_stages=ATTENTION_NUM_STAGES,
         )
 
         if head_dim_padded != head_dim:
