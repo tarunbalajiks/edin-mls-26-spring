@@ -746,6 +746,11 @@ class GlmAsrModel:
         Returns:
             Generated token IDs
         """
+        if torch.cuda.is_available():
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.backends.cudnn.benchmark = True
+
         # Encode audio
         audio_embeds = self.encode_audio(input_features, input_features_mask)
 
@@ -815,12 +820,20 @@ class GlmAsrModel:
             eos_token_ids, dtype=torch.int64, device=generated.device
         )
 
-        # Autoregressive generation
-        logits, past_key_values = self.decode(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            use_cache=True,
+        # Autoregressive generation with pre-allocated KV buffers
+        max_seq_len = inputs_embeds.shape[1] + max_new_tokens
+        kv_buffers = self.text_decoder.allocate_kv_buffers(
+            batch_size,
+            max_seq_len,
+            dtype=inputs_embeds.dtype,
         )
+
+        hidden_states, cache_pos = self.text_decoder.forward_with_kv_buffers(
+            inputs_embeds,
+            kv_buffers,
+            cache_pos=0,
+        )
+        logits = self.lm_head(hidden_states)
         next_token_logits = logits[:, -1, :] / temperature
 
         for _ in range(max_new_tokens):
@@ -863,14 +876,14 @@ class GlmAsrModel:
             if torch.all(finished):
                 break
 
-            # Decode only the new token with KV cache
+            # Decode only the new token with KV buffers
             new_embeds = self.text_decoder.embed_tokens(next_token)
-            logits, past_key_values = self.decode(
-                inputs_embeds=new_embeds,
-                attention_mask=attention_mask,
-                past_key_values=past_key_values,
-                use_cache=True,
+            hidden_states, cache_pos = self.text_decoder.forward_with_kv_buffers(
+                new_embeds,
+                kv_buffers,
+                cache_pos=cache_pos,
             )
+            logits = self.lm_head(hidden_states)
             next_token_logits = logits[:, -1, :] / temperature
 
         return generated
