@@ -239,6 +239,7 @@ def flash_attention_kernel(
 
     for k_start in range(0, seq_k, BLOCK_N):
         offs_n = k_start + tl.arange(0, BLOCK_N)
+        mask_n = offs_n < seq_k
 
         k = tl.load(
             k_ptr
@@ -251,6 +252,7 @@ def flash_attention_kernel(
         k = k.to(tl.float32)
 
         qk = tl.dot(q, tl.trans(k)) * scale
+        qk = tl.where(mask_n[None, :], qk, -float("inf"))
 
         if IS_CAUSAL:
             causal_mask = offs_n[None, :] > offs_m[:, None]
@@ -432,8 +434,8 @@ def scaled_dot_product_attention(
                 v_flat,
                 output,
                 seq_q,
-                seq_k_padded,
-                head_dim_padded,
+                seq_k,
+                head_dim,
                 q_flat.stride(0),
                 q_flat.stride(1),
                 q_flat.stride(2),
