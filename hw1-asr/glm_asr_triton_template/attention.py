@@ -192,6 +192,100 @@ def causal_mask_kernel(
     )
 
 
+@triton.jit
+def flash_attention_kernel(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    o_ptr,
+    seq_q,
+    seq_k,
+    head_dim,
+    stride_q0,
+    stride_q1,
+    stride_q2,
+    stride_k0,
+    stride_k1,
+    stride_k2,
+    stride_v0,
+    stride_v1,
+    stride_v2,
+    stride_o0,
+    stride_o1,
+    stride_o2,
+    scale,
+    IS_CAUSAL: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """FlashAttention-style fused QK^T, softmax, and V accumulation."""
+    pid_bh = tl.program_id(0)
+    pid_m = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, BLOCK_D)
+
+    q = tl.load(
+        q_ptr + pid_bh * stride_q0 + offs_m[:, None] * stride_q1 + offs_d[None, :] * stride_q2,
+        mask=(offs_m[:, None] < seq_q) & (offs_d[None, :] < head_dim),
+        other=0.0,
+    )
+    q = q.to(tl.float32)
+
+    m_i = tl.full((BLOCK_M,), -float("inf"), dtype=tl.float32)
+    l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
+
+    for k_start in range(0, seq_k, BLOCK_N):
+        offs_n = k_start + tl.arange(0, BLOCK_N)
+
+        k = tl.load(
+            k_ptr
+            + pid_bh * stride_k0
+            + offs_n[:, None] * stride_k1
+            + offs_d[None, :] * stride_k2,
+            mask=(offs_n[:, None] < seq_k) & (offs_d[None, :] < head_dim),
+            other=0.0,
+        )
+        k = k.to(tl.float32)
+
+        qk = tl.dot(q, tl.trans(k)) * scale
+
+        if IS_CAUSAL:
+            causal_mask = offs_n[None, :] > offs_m[:, None]
+            qk = tl.where(causal_mask, -float("inf"), qk)
+
+        m_ij = tl.max(qk, axis=1)
+        m_new = tl.maximum(m_i, m_ij)
+
+        p = tl.exp(qk - m_new[:, None])
+        l_new = l_i * tl.exp(m_i - m_new) + tl.sum(p, axis=1)
+
+        v = tl.load(
+            v_ptr
+            + pid_bh * stride_v0
+            + offs_n[:, None] * stride_v1
+            + offs_d[None, :] * stride_v2,
+            mask=(offs_n[:, None] < seq_k) & (offs_d[None, :] < head_dim),
+            other=0.0,
+        )
+        v = v.to(tl.float32)
+
+        acc = acc * (l_i * tl.exp(m_i - m_new))[:, None] + tl.dot(p, v)
+
+        m_i = m_new
+        l_i = l_new
+
+    acc = acc / l_i[:, None]
+
+    tl.store(
+        o_ptr + pid_bh * stride_o0 + offs_m[:, None] * stride_o1 + offs_d[None, :] * stride_o2,
+        acc,
+        mask=(offs_m[:, None] < seq_q) & (offs_d[None, :] < head_dim),
+    )
+
+
 # ============================================================================
 # Attention Classes
 # ============================================================================
@@ -265,6 +359,10 @@ ATTENTION_NUM_WARPS = 4
 ATTENTION_NUM_STAGES = 2
 SOFTMAX_NUM_WARPS = 4
 SOFTMAX_NUM_STAGES = 2
+FLASH_BLOCK_M = 64
+FLASH_BLOCK_N = 64
+FLASH_NUM_WARPS = 4
+FLASH_NUM_STAGES = 2
 
 
 def scaled_dot_product_attention(
@@ -293,6 +391,8 @@ def scaled_dot_product_attention(
         and head_dim_padded <= MAX_ATTENTION_DIM
     )
 
+    use_flash = use_triton and attention_mask is None
+
     if use_triton:
         q_flat = q.reshape(batch * num_heads, seq_q, head_dim).to(torch.float32)
         k_flat = k.reshape(batch * num_heads, seq_k, head_dim).to(torch.float32)
@@ -317,11 +417,6 @@ def scaled_dot_product_attention(
             v_flat = v_padded
             q_flat = q_padded
 
-        scores = torch.empty(
-            (batch * num_heads, seq_q, seq_k_padded),
-            dtype=torch.float32,
-            device=q.device,
-        )
         output = torch.empty(
             (batch * num_heads, seq_q, head_dim_padded),
             dtype=torch.float32,
@@ -329,86 +424,122 @@ def scaled_dot_product_attention(
         )
 
         grid = (batch * num_heads, seq_q)
-        attention_scores_kernel[grid](
-            q_flat,
-            k_flat,
-            scores,
-            float(scale),
-            seq_k_padded,
-            head_dim_padded,
-            q_flat.stride(0),
-            q_flat.stride(1),
-            q_flat.stride(2),
-            k_flat.stride(0),
-            k_flat.stride(1),
-            k_flat.stride(2),
-            scores.stride(0),
-            scores.stride(1),
-            scores.stride(2),
-            BLOCK_K=seq_k_padded,
-            BLOCK_D=head_dim_padded,
-            num_warps=ATTENTION_NUM_WARPS,
-            num_stages=ATTENTION_NUM_STAGES,
-        )
+        if use_flash:
+            flash_grid = (batch * num_heads, triton.cdiv(seq_q, FLASH_BLOCK_M))
+            flash_attention_kernel[flash_grid](
+                q_flat,
+                k_flat,
+                v_flat,
+                output,
+                seq_q,
+                seq_k_padded,
+                head_dim_padded,
+                q_flat.stride(0),
+                q_flat.stride(1),
+                q_flat.stride(2),
+                k_flat.stride(0),
+                k_flat.stride(1),
+                k_flat.stride(2),
+                v_flat.stride(0),
+                v_flat.stride(1),
+                v_flat.stride(2),
+                output.stride(0),
+                output.stride(1),
+                output.stride(2),
+                float(scale),
+                IS_CAUSAL=is_causal,
+                BLOCK_M=FLASH_BLOCK_M,
+                BLOCK_N=FLASH_BLOCK_N,
+                BLOCK_D=head_dim_padded,
+                num_warps=FLASH_NUM_WARPS,
+                num_stages=FLASH_NUM_STAGES,
+            )
+        else:
+            scores = torch.empty(
+                (batch * num_heads, seq_q, seq_k_padded),
+                dtype=torch.float32,
+                device=q.device,
+            )
+            attention_scores_kernel[grid](
+                q_flat,
+                k_flat,
+                scores,
+                float(scale),
+                seq_k_padded,
+                head_dim_padded,
+                q_flat.stride(0),
+                q_flat.stride(1),
+                q_flat.stride(2),
+                k_flat.stride(0),
+                k_flat.stride(1),
+                k_flat.stride(2),
+                scores.stride(0),
+                scores.stride(1),
+                scores.stride(2),
+                BLOCK_K=seq_k_padded,
+                BLOCK_D=head_dim_padded,
+                num_warps=ATTENTION_NUM_WARPS,
+                num_stages=ATTENTION_NUM_STAGES,
+            )
 
-        if seq_k_padded != seq_k:
-            scores[:, :, seq_k:] = -1e9
-
-        if is_causal:
-            mask = torch.triu(
-                torch.ones((seq_q, seq_k_padded), dtype=torch.float32, device=q.device),
-                diagonal=1,
-            ) * -1e9
-            scores = scores + mask[None, :, :]
-
-        if attention_mask is not None:
-            if attention_mask.ndim == 4:
-                attention_mask = attention_mask.reshape(
-                    batch * num_heads, seq_q, seq_k
-                )
             if seq_k_padded != seq_k:
-                mask_padded = torch.zeros(
-                    (batch * num_heads, seq_q, seq_k_padded),
-                    dtype=torch.float32,
-                    device=q.device,
-                )
-                mask_padded[:, :, :seq_k] = attention_mask
-                mask_padded[:, :, seq_k:] = -1e9
-                attention_mask = mask_padded
-            scores = scores + attention_mask
+                scores[:, :, seq_k:] = -1e9
 
-        scores_2d = scores.reshape(batch * num_heads * seq_q, seq_k_padded)
-        block = seq_k_padded
-        softmax_inplace_kernel[(scores_2d.shape[0],)](
-            scores_2d,
-            scores_2d.stride(0),
-            seq_k_padded,
-            BLOCK_SIZE=block,
-            num_warps=SOFTMAX_NUM_WARPS,
-            num_stages=SOFTMAX_NUM_STAGES,
-        )
-        scores = scores_2d.reshape(batch * num_heads, seq_q, seq_k_padded)
+            if is_causal:
+                mask = torch.triu(
+                    torch.ones((seq_q, seq_k_padded), dtype=torch.float32, device=q.device),
+                    diagonal=1,
+                ) * -1e9
+                scores = scores + mask[None, :, :]
 
-        attention_output_kernel[grid](
-            scores,
-            v_flat,
-            output,
-            seq_k_padded,
-            head_dim_padded,
-            scores.stride(0),
-            scores.stride(1),
-            scores.stride(2),
-            v_flat.stride(0),
-            v_flat.stride(1),
-            v_flat.stride(2),
-            output.stride(0),
-            output.stride(1),
-            output.stride(2),
-            BLOCK_K=seq_k_padded,
-            BLOCK_D=head_dim_padded,
-            num_warps=ATTENTION_NUM_WARPS,
-            num_stages=ATTENTION_NUM_STAGES,
-        )
+            if attention_mask is not None:
+                if attention_mask.ndim == 4:
+                    attention_mask = attention_mask.reshape(
+                        batch * num_heads, seq_q, seq_k
+                    )
+                if seq_k_padded != seq_k:
+                    mask_padded = torch.zeros(
+                        (batch * num_heads, seq_q, seq_k_padded),
+                        dtype=torch.float32,
+                        device=q.device,
+                    )
+                    mask_padded[:, :, :seq_k] = attention_mask
+                    mask_padded[:, :, seq_k:] = -1e9
+                    attention_mask = mask_padded
+                scores = scores + attention_mask
+
+            scores_2d = scores.reshape(batch * num_heads * seq_q, seq_k_padded)
+            block = seq_k_padded
+            softmax_inplace_kernel[(scores_2d.shape[0],)](
+                scores_2d,
+                scores_2d.stride(0),
+                seq_k_padded,
+                BLOCK_SIZE=block,
+                num_warps=SOFTMAX_NUM_WARPS,
+                num_stages=SOFTMAX_NUM_STAGES,
+            )
+            scores = scores_2d.reshape(batch * num_heads, seq_q, seq_k_padded)
+
+            attention_output_kernel[grid](
+                scores,
+                v_flat,
+                output,
+                seq_k_padded,
+                head_dim_padded,
+                scores.stride(0),
+                scores.stride(1),
+                scores.stride(2),
+                v_flat.stride(0),
+                v_flat.stride(1),
+                v_flat.stride(2),
+                output.stride(0),
+                output.stride(1),
+                output.stride(2),
+                BLOCK_K=seq_k_padded,
+                BLOCK_D=head_dim_padded,
+                num_warps=ATTENTION_NUM_WARPS,
+                num_stages=ATTENTION_NUM_STAGES,
+            )
 
         if head_dim_padded != head_dim:
             output = output[:, :, :head_dim]
