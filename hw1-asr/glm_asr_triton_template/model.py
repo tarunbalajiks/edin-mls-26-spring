@@ -816,10 +816,14 @@ class GlmAsrModel:
         )
 
         # Autoregressive generation
+        logits, past_key_values = self.decode(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            use_cache=True,
+        )
+        next_token_logits = logits[:, -1, :] / temperature
+
         for _ in range(max_new_tokens):
-            # Get logits for next token
-            logits = self.decode(inputs_embeds=inputs_embeds)
-            next_token_logits = logits[:, -1, :] / temperature
 
             # Top-k sampling
             if top_k > 0 and top_k < next_token_logits.shape[-1]:
@@ -859,8 +863,14 @@ class GlmAsrModel:
             if torch.all(finished):
                 break
 
-            # Update inputs_embeds with new token
+            # Decode only the new token with KV cache
             new_embeds = self.text_decoder.embed_tokens(next_token)
-            inputs_embeds = torch.cat([inputs_embeds, new_embeds], dim=1)
+            logits, past_key_values = self.decode(
+                inputs_embeds=new_embeds,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                use_cache=True,
+            )
+            next_token_logits = logits[:, -1, :] / temperature
 
         return generated
